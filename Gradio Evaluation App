@@ -1,0 +1,329 @@
+# app_gradio_poomsae14.py
+from __future__ import annotations
+import os, tempfile
+import numpy as np
+import gradio as gr
+import cv2
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Callable
+from scipy.linalg import svd
+from mmpose.apis import MMPoseInferencer
+
+COCO = dict(nose=0,l_eye=1,r_eye=2,l_ear=3,r_ear=4,l_shoulder=5,r_shoulder=6,l_elbow=7,r_elbow=8,l_wrist=9,r_wrist=10,l_hip=11,r_hip=12,l_knee=13,r_knee=14,l_ankle=15,r_ankle=16)
+ALIAS_TO_INDEX = {'L_foot': COCO['l_ankle'],'R_foot': COCO['r_ankle'],'L_knee': COCO['l_knee'],'R_knee': COCO['r_knee'],'L_elbow': COCO['l_elbow'],'R_elbow': COCO['r_elbow'],'L_fist': COCO['l_wrist'],'R_fist': COCO['r_wrist'],'L_shoulder': COCO['l_shoulder'],'R_shoulder': COCO['r_shoulder']}
+LR_SWAP = {'L_foot':'R_foot','R_foot':'L_foot','L_knee':'R_knee','R_knee':'L_knee','L_elbow':'R_elbow','R_elbow':'L_elbow','L_fist':'R_fist','R_fist':'L_fist','L_shoulder':'R_shoulder','R_shoulder':'L_shoulder','hip':'hip','head':'head'}
+
+def pelvis_xy(frame17: np.ndarray) -> np.ndarray:
+    return (frame17[COCO['l_hip']] + frame17[COCO['r_hip']]) / 2.0
+
+def head_center_xy(frame17: np.ndarray) -> np.ndarray:
+    pts = [COCO['nose'], COCO['l_eye'], COCO['r_eye'], COCO['l_ear'], COCO['r_ear']]
+    ok = [p for p in pts if np.isfinite(frame17[p]).all()]
+    if not ok:
+        return np.array([np.nan, np.nan])
+    return frame17[ok].mean(axis=0)
+
+@dataclass
+class MovementSpec:
+    name: str
+    aliases: List[str]
+    funcs: Dict[str, Callable[[float], np.ndarray]]
+    anchor_alias: str = 'hip'
+    retarget_edges: List[Tuple[str,str]] = field(default_factory=list)
+
+def right_ap_seogi_funcs():
+    def L_foot(t): return np.array([0.59,0.14])
+    def L_knee(t): return np.array([0.2074*t+0.4847, 0.0733*t**4-0.1989*t**3+0.129*t**2+0.0071*t+0.546])
+    def hip(t): return np.array([0.3359*t+0.3787, 0.056*t**4-0.1954*t**3+0.1971*t**2-0.0596*t+0.9914])
+    def R_knee(t): return np.array([0.587*t+0.1867, -0.0994*t**2+0.1406*t+0.53])
+    def R_foot(t): return np.array([0.8438*t-0.0786, 0.3661*t**4-1.0228*t**3+0.7254*t**2-0.0460*t+0.1390])
+    return {'L_foot':L_foot,'L_knee':L_knee,'hip':hip,'R_knee':R_knee,'R_foot':R_foot}
+
+def right_ap_chagi_funcs():
+    def L_foot(t): return np.array([0.6900,0.1300])
+    def L_knee(t): return np.array([0.0863*t+0.6558, -0.3704*t**5+1.8446*t**4-3.1465*t**3+2.0026*t**2+0.4830])
+    def hip(t): return np.array([0.2218*t+0.5317, -0.1122*t**2+0.1864*t+0.8955])
+    def R_knee(t): return np.array([-0.5926*t**2+1.4319*t+0.3078, 1.1101*t**3-3.9583*t**2+3.7593*t+0.1096])
+    def R_foot(t): return np.array([-0.8661*t**2+2.1206*t+0.0426, 1.7849*t**3-6.2892*t**2+5.8082*t-0.4987])
+    def head(t): return np.array([0.2870*t+0.4466, -0.0313*t**2+0.0795*t+1.6666])
+    return {'L_foot':L_foot,'L_knee':L_knee,'hip':hip,'R_knee':R_knee,'R_foot':R_foot,'head':head}
+
+def right_ap_gubi_funcs():
+    def L_foot(t): return np.array([0.9300,0.1200])
+    def L_knee(t): return np.array([0.1326*t+0.9841, 0.0227*t**2-0.0759*t+0.5106])
+    def hip(t): return np.array([-0.1191*t**5+0.7457*t**4-1.6581*t**3+1.5200*t**2-0.4806*t+1.5172, 0.4516*t+0.7617])
+    def R_knee(t): return np.array([0.7744*t+0.5066, -0.0237*t**3+0.0590*t**2+0.0124*t+0.4620])
+    def R_foot(t): return np.array([0.9540*t+0.1779, 0.2929*t**6-2.1359*t**5+5.8894*t**4-7.5048*t**3+4.2331*t**2-0.7730*t+0.1141])
+    return {'L_foot':L_foot,'L_knee':L_knee,'hip':hip,'R_knee':R_knee,'R_foot':R_foot}
+
+def right_momtong_jireugi_funcs():
+    def L_fist(t): return np.array([0.8741*t+0.1474, -0.8934*t+1.6191])
+    def L_elbow(t): return np.array([0.1786*t+0.4633, -0.3742*t+1.4563])
+    def head(t): return np.array([0.3800,1.7000])
+    def R_elbow(t): return np.array([-0.4626*t+0.3520, 5.2636*t**5-13.4840*t**4+12.3260*t**3-4.5470*t**2+0.5069*t+1.2876])
+    def R_fist(t): return np.array([-0.5902*t+0.7129, -0.6464*t**3+0.8851*t**2-0.2567*t+1.1724])
+    return {'L_fist':L_fist,'L_elbow':L_elbow,'head':head,'R_elbow':R_elbow,'R_fist':R_fist}
+
+def left_arae_makki_funcs():
+    def L_fist(t): return np.array([-0.6249*t+0.9863, 0.2357*t**3-0.5096*t**2+0.1924*t+1.1815])
+    def L_elbow(t): return np.array([-0.4823*t+0.6723, 0.8104*t**5-3.3107*t**4+4.8168*t**3-2.8823*t**2+0.5419*t+1.2583])
+    def head(t): return np.array([0.4100,1.6300])
+    def R_elbow(t): return np.array([0.5103*t+0.1561, -0.1232*t**2+0.3031*t+1.1815])
+    def R_fist(t): return np.array([-0.5699*t+0.3995, -0.2087*t**2+0.3880*t+1.1020])
+    return {'L_fist':L_fist,'L_elbow':L_elbow,'head':head,'R_elbow':R_elbow,'R_fist':R_fist}
+
+def right_momtong_makki_funcs():
+    def L_fist(t): return np.array([-1.5982*t+1.3785, -0.2990*t+1.2415])
+    def L_elbow(t): return np.array([-1.4961*t+1.1486, -15.9860*t**4+20.8000*t**3-8.0494*t**2+0.7850*t+1.2542])
+    def L_shoulder(t): return np.array([-0.7286*t+0.8559, -25.0090*t**5+38.0250*t**4-19.0200*t**3+3.3308*t**2-0.1087*t+1.3942])
+    def head(t): return np.array([0.6800,1.6300])
+    def R_shoulder(t): return np.array([0.2333*t+0.5251, -83.0370*t**6+149.1000*t**5-100.3100*t**4+31.6350*t**3-4.9180*t**2+0.4070*t+1.3910])
+    def R_elbow(t): return np.array([1.1083*t+0.3728, -0.1430*t+1.2878])
+    def R_fist(t): return np.array([1.8585*t+0.2460, -0.4328*t+1.6017])
+    return {'L_fist':L_fist,'L_elbow':L_elbow,'L_shoulder':L_shoulder,'head':head,'R_shoulder':R_shoulder,'R_elbow':R_elbow,'R_fist':R_fist}
+
+def left_olgul_makki_funcs():
+    def L_fist(t): return np.array([0.6006*t**3-1.0520*t**2+0.5846*t+0.4677, -2.1389*t**2+2.5386*t+1.1930])
+    def L_elbow(t): return np.array([-3.2700*t**4+5.9761*t**3-3.1766*t**2+0.3222*t+0.5386, -1.5328*t**2+1.7366*t+1.2062])
+    def head(t): return np.array([0.3800,1.6400])
+    def R_elbow(t): return np.array([0.9346*t**2-1.1575*t+0.4457, -1.5860*t**3+2.5606*t**2-1.2124*t+1.3623])
+    def R_fist(t): return np.array([0.5659*t**2-0.7286*t+0.5776, 1.0934*t**2-1.3470*t+1.4880])
+    return {'L_fist':L_fist,'L_elbow':L_elbow,'head':head,'R_elbow':R_elbow,'R_fist':R_fist}
+
+MOVEMENTS: Dict[str, MovementSpec] = {
+    'right_ap_seogi': MovementSpec('right_ap_seogi',['L_foot','L_knee','hip','R_knee','R_foot'], right_ap_seogi_funcs(), 'hip', [('hip','L_knee'),('L_knee','L_foot'),('hip','R_knee'),('R_knee','R_foot')]),
+    'right_ap_chagi': MovementSpec('right_ap_chagi',['L_foot','L_knee','hip','R_knee','R_foot','head'], right_ap_chagi_funcs(), 'hip', [('hip','L_knee'),('L_knee','L_foot'),('hip','R_knee'),('R_knee','R_foot')]),
+    'right_ap_gubi': MovementSpec('right_ap_gubi',['L_foot','L_knee','hip','R_knee','R_foot'], right_ap_gubi_funcs(), 'hip', [('hip','L_knee'),('L_knee','L_foot'),('hip','R_knee'),('R_knee','R_foot')]),
+    'right_momtong_jireugi': MovementSpec('right_momtong_jireugi',['L_fist','L_elbow','head','R_elbow','R_fist'], right_momtong_jireugi_funcs(), 'head', []),
+    'left_arae_makki': MovementSpec('left_arae_makki',['L_fist','L_elbow','head','R_elbow','R_fist'], left_arae_makki_funcs(), 'head', []),
+    'right_momtong_makki': MovementSpec('right_momtong_makki',['L_fist','L_elbow','L_shoulder','head','R_shoulder','R_elbow','R_fist'], right_momtong_makki_funcs(), 'head', [('L_shoulder','L_elbow'),('L_elbow','L_fist'),('R_shoulder','R_elbow'),('R_elbow','R_fist')]),
+    'left_olgul_makki': MovementSpec('left_olgul_makki',['L_fist','L_elbow','head','R_elbow','R_fist'], left_olgul_makki_funcs(), 'head', [])
+}
+
+DISPLAY = {
+    'right_ap_seogi': 'Right Ap-seogi',
+    'right_ap_chagi': 'Right Ap-chagi',
+    'right_ap_gubi': 'Right Ap-gubi',
+    'right_momtong_jireugi': 'Right Momtong Jireugi',
+    'left_arae_makki': 'Left-hand Arae makki',
+    'right_momtong_makki': 'Right-handed Momtong makki',
+    'left_olgul_makki': 'Left-handed Olgul makki'
+}
+
+def sample_template(spec: MovementSpec, times_01: np.ndarray) -> np.ndarray:
+    out = np.zeros((len(times_01), len(spec.aliases), 2), float)
+    for i, tt in enumerate(times_01):
+        for j, a in enumerate(spec.aliases):
+            out[i, j, :] = spec.funcs[a](tt)
+    return out
+
+def reflect_template(spec: MovementSpec, X: np.ndarray, times_01: np.ndarray) -> Tuple[List[str], np.ndarray]:
+    anchor = np.array([spec.funcs[spec.anchor_alias](tt) for tt in times_01])
+    Xmir = X.copy(); Xmir[...,0] = 2*anchor[:,None,0] - Xmir[...,0]
+    aliases_m = [LR_SWAP.get(a,a) for a in spec.aliases]
+    order = [aliases_m.index(a) if a in aliases_m else i for i,a in enumerate(spec.aliases)]
+    Xmir = Xmir[:, order, :]
+    return aliases_m, Xmir
+
+def retarget_limb_lengths(spec: MovementSpec, tpl: np.ndarray, obs: np.ndarray) -> np.ndarray:
+    if not spec.retarget_edges:
+        return tpl
+    out = tpl.copy(); alias_idx = {a:i for i,a in enumerate(spec.aliases)}
+    for t in range(tpl.shape[0]):
+        for parent, child in spec.retarget_edges:
+            if parent not in alias_idx or child not in alias_idx:
+                continue
+            pi, ci = alias_idx[parent], alias_idx[child]
+            v_tpl = out[t, ci] - out[t, pi]
+            v_obs = obs[t, ci] - obs[t, pi]
+            len_tpl = float(np.linalg.norm(v_tpl)) + 1e-8
+            len_obs = float(np.linalg.norm(v_obs))
+            out[t, ci] = out[t, pi] + v_tpl * (len_obs / len_tpl)
+    return out
+
+def _read_video_meta(path: str):
+    cap = cv2.VideoCapture(path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release(); return fps,W,H,N
+
+def estimate_stabilization(path: str, stride: int=1):
+    cap = cv2.VideoCapture(path)
+    prev = None
+    transforms = []
+    while True:
+        idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx % stride != 0:
+            transforms.append(np.eye(3, dtype=np.float32))
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev is None:
+            prev = gray
+            transforms.append(np.eye(3, dtype=np.float32))
+            continue
+        warp = np.eye(2,3, dtype=np.float32)
+        try:
+            cv2.findTransformECC(prev, gray, warp, cv2.MOTION_AFFINE)
+            M = np.vstack([warp, [0,0,1]]).astype(np.float32)
+        except Exception:
+            M = np.eye(3, dtype=np.float32)
+        transforms.append(M)
+        prev = gray
+    cap.release()
+    cum = []
+    C = np.eye(3, dtype=np.float32)
+    for M in transforms:
+        C = M @ C
+        cum.append(np.linalg.inv(C))
+    return cum
+
+def extract_keypoints(video_path: str, kpt_thr: float, model_alias: str='human', stride: int=1):
+    infer = MMPoseInferencer(model_alias)
+    fps,W,H,N = _read_video_meta(video_path)
+    times=[]; keyseq=[]; scoreseq=[]; idx=0
+    for i, out in enumerate(infer(video_path, return_vis=False, kpt_thr=kpt_thr, draw_bbox=False, use_oks_tracking=True)):
+        if i % stride != 0:
+            idx+=1; continue
+        preds = out.get('predictions',[[]])
+        inst = preds[0][0] if preds and preds[0] else None
+        xys = np.full((17,2), np.nan, float); scs = np.zeros((17,), float)
+        if inst is not None:
+            k = np.asarray(inst['keypoints'])
+            if k.shape[-1]>=2:
+                xys = k[..., :2]
+            if 'keypoint_scores' in inst:
+                scs = np.asarray(inst['keypoint_scores'])
+            elif k.shape[-1]>=3:
+                scs = k[...,2]
+        times.append(i/fps)
+        keyseq.append(xys)
+        scoreseq.append(scs)
+        idx+=1
+    return np.array(times), np.array(keyseq), np.array(scoreseq)
+
+def normalize_times_to_01(times: np.ndarray) -> np.ndarray:
+    if len(times)<=1: return np.zeros_like(times)
+    return (times - times[0]) / (times[-1]-times[0] + 1e-8)
+
+def weighted_similarity_transform(A: np.ndarray, B: np.ndarray, w: np.ndarray):
+    w = w/(w.sum()+1e-8)
+    muA=(w[:,None]*A).sum(0); muB=(w[:,None]*B).sum(0)
+    A0=A-muA; B0=B-muB; H=(A0*w[:,None]).T@B0
+    U,S,Vt=svd(H); R=Vt.T@U.T
+    if np.linalg.det(R)<0:
+        Vt[1,:]*=-1; R=Vt.T@U.T
+    s=S.sum()/((w[:,None]*(A0**2)).sum()+1e-8)
+    t=muB - s*(R@muA)
+    return s,R,t
+
+def frame_error(template_J2: np.ndarray, observed_J2: np.ndarray, conf_J: np.ndarray):
+    s,R,t=weighted_similarity_transform(template_J2,observed_J2,conf_J)
+    mapped=(s*(template_J2@R.T))+t
+    d=np.linalg.norm(mapped-observed_J2,axis=1)
+    rmse=float(np.sqrt((conf_J*(d**2)).sum()/(conf_J.sum()+1e-8)))
+    return rmse
+
+def eval_segment(P_seg: np.ndarray, W_seg: np.ndarray, spec: MovementSpec):
+    T = P_seg.shape[0]
+    t01 = np.linspace(0,1,T)
+    tpl = sample_template(spec,t01)
+    _, tplm = reflect_template(spec,tpl,t01)
+    tpl_rt = retarget_limb_lengths(spec,tpl,P_seg)
+    tplm_rt = retarget_limb_lengths(spec,tplm,P_seg)
+    err_o = np.mean([frame_error(tpl_rt[i], P_seg[i], W_seg[i]) for i in range(T)])
+    err_m = np.mean([frame_error(tplm_rt[i], P_seg[i], W_seg[i]) for i in range(T)])
+    if err_m<err_o:
+        return err_m,'left'
+    return err_o,'right'
+
+def stabilize_keypoints(keyseq: np.ndarray, cum_transforms: List[np.ndarray]):
+    out = keyseq.copy()
+    for i in range(min(len(out), len(cum_transforms))):
+        M = cum_transforms[i]
+        for j in range(out.shape[1]):
+            x,y = out[i,j]
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            v = np.array([x,y,1.0]); vv = M @ v
+            out[i,j,0] = vv[0]; out[i,j,1] = vv[1]
+    return out
+
+def analyze_poomsae(video, segments:int, kpt_thr:float, stabilize:bool, stride:int, model_alias:str):
+    if video is None:
+        return {"error": "Please upload a video."}, None
+    path = video if isinstance(video,str) else video
+    fps,W,H,N = _read_video_meta(path)
+    times, keys, scores = extract_keypoints(path, kpt_thr=kpt_thr, model_alias=model_alias, stride=stride)
+    if stabilize:
+        cum = estimate_stabilization(path, stride=stride)
+        keys = stabilize_keypoints(keys, cum)
+    masks = []
+    for i in range(keys.shape[0]):
+        m = np.ones((len(ALIAS_TO_INDEX)+2,), float)
+        masks.append(m)
+    masks = np.array(masks)
+    splits = np.linspace(0, keys.shape[0], segments+1).astype(int)
+    per_segment = []
+    for s in range(segments):
+        a,b = splits[s], splits[s+1]
+        if b<=a+1:
+            per_segment.append({"segment": s+1, "start": float(times[a]), "end": float(times[min(b-1,a)]), "best_movement": None, "side": None, "score": 0.0, "rmse": None})
+            continue
+        P = keys[a:b]; W = np.clip(scores[a:b],0,1)
+        results = []
+        for k,spec in MOVEMENTS.items():
+            idxs = [ALIAS_TO_INDEX.get(a,None) for a in spec.aliases]
+            obs = np.zeros((P.shape[0], len(spec.aliases), 2), float)
+            conf = np.zeros((P.shape[0], len(spec.aliases)), float)
+            for j,a_name in enumerate(spec.aliases):
+                if a_name=='hip':
+                    obs[:,j,:] = (P[:,COCO['l_hip'],:]+P[:,COCO['r_hip'],:])/2.0
+                    conf[:,j] = np.minimum(scores[a:b,COCO['l_hip']], scores[a:b,COCO['r_hip']])
+                elif a_name=='head':
+                    head = np.nanmean(P[:,[COCO['nose'],COCO['l_eye'],COCO['r_eye'],COCO['l_ear'],COCO['r_ear']],:], axis=1)
+                    obs[:,j,:] = head
+                    conf[:,j] = 1.0
+                else:
+                    idx = ALIAS_TO_INDEX[a_name]
+                    obs[:,j,:] = P[:,idx,:]
+                    conf[:,j] = scores[a:b,idx]
+            rmse, side = eval_segment(obs, conf, spec)
+            results.append((k,rmse,side))
+        results.sort(key=lambda x:x[1])
+        best_k, best_rmse, side = results[0]
+        score = float(np.clip(1.0 - best_rmse/0.15, 0.0, 1.0))
+        per_segment.append({"segment": s+1, "start": float(times[a]), "end": float(times[b-1]), "best_movement": DISPLAY.get(best_k,best_k), "side": side, "score": score, "rmse": float(best_rmse)})
+    csv_lines = ["segment,start,end,best_movement,side,score,rmse"]
+    for it in per_segment:
+        csv_lines.append(f"{it['segment']},{it['start']:.3f},{it['end']:.3f},{it['best_movement']},{it['side']},{it['score']:.3f},{it['rmse']:.4f}")
+    csv_path = tempfile.NamedTemporaryFile(delete=False, suffix='.csv').name
+    with open(csv_path,'w',encoding='utf-8') as f:
+        f.write("\n".join(csv_lines))
+    summary = {"fps": fps, "resolution": f"{W}x{H}", "frames": int(N), "stride": int(stride)}
+    return {"summary": summary, "segments": per_segment}, csv_path
+
+with gr.Blocks(title="Poomsae 14 Analyzer") as demo:
+    gr.Markdown("## Advanced Poomsae Trainer (14 segments) — Offline\nUpload one full poomsae video; the app splits it into N segments, compensates camera motion, and scores each segment against your movement templates.")
+    with gr.Row():
+        vid = gr.Video(label="Poomsae video", sources=["upload"], include_audio=False)
+    with gr.Row():
+        segments = gr.Slider(1, 20, value=14, step=1, label="Number of segments")
+        kpt_thr = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="Keypoint threshold")
+        stride = gr.Slider(1, 5, value=1, step=1, label="Sample every Nth frame")
+        stabilize = gr.Checkbox(value=True, label="Stabilize camera")
+        model_alias = gr.Dropdown(["human"], value="human", label="Pose model")
+    go = gr.Button("Analyze", variant="primary")
+    out_json = gr.JSON(label="Results")
+    out_csv = gr.File(label="Download CSV")
+    def _run(v, segs, thr, stab, strd, model):
+        res, csvp = analyze_poomsae(v, int(segs), float(thr), bool(stab), int(strd), model)
+        return res, csvp
+    go.click(_run, [vid, segments, kpt_thr, stabilize, stride, model_alias], [out_json, out_csv])
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True)
