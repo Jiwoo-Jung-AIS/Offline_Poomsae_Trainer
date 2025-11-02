@@ -1,0 +1,8 @@
+mmengine
+mmcv-lite>=2.0.0
+mmpose>=1.0.0
+gradio
+opencv-python
+numpy
+scipy
+pandas
