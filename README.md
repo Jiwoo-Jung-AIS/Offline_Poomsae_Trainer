@@ -1,2 +1,5 @@
-# Offline_Poomsae_Trainer
-Advanced Taekwondo poomsae trainer measuring accuracy of 14 different basic movements offline using Gradio and OpenMMLab's MMPose
+This repository implements an offline computer-vision framework for quantitative analysis of Taekwondo poomsae movements. The system applies OpenMMLab’s MMPose pose-estimation pipeline to extract COCO-17 skeletal keypoints from video input and evaluates user performance across 14 foundational poomsae movements through joint-level spatial comparison against reference templates.
+
+The model operates entirely offline, enabling deployment in settings without reliable internet access. A lightweight Gradio interface manages video input, pose visualization, and numerical accuracy metrics. Movement evaluation emphasizes consistency, alignment, and relative joint positioning rather than competitive scoring or ranking.
+
+The project prioritizes reliable pose extraction, reproducible movement comparison, and low-friction deployment. It is designed as a technical training and feedback tool rather than a judging system, emphasizing interpretability, robustness, and accessibility. The system is currently deployed at Viennese refugee centers operated by organizations including Caritas Wien and FSW Obdach, where it is used to support independent practice for refugee children and is iteratively updated based on on-site feedback.
